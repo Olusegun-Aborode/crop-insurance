@@ -1,126 +1,85 @@
-const {
-  time,
-  loadFixture,
-} = require("@nomicfoundation/hardhat-toolbox/network-helpers");
-const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
-const { expect } = require("chai");
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.15;
 
-describe("Lock", function () {
-  // We define a fixture to reuse the same setup in every test.
-  // We use loadFixture to run this setup once, snapshot that state,
-  // and reset Hardhat Network to that snapshot in every test.
-  async function deployOneYearLockFixture() {
-    const ONE_YEAR_IN_SECS = 365 * 24 * 60 * 60;
-    const ONE_GWEI = 1_000_000_000;
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/interfaces/IERC20.sol";
 
-    const lockedAmount = ONE_GWEI;
-    const unlockTime = (await time.latest()) + ONE_YEAR_IN_SECS;
+contract Insurance is ERC20 {
+    using SafeMath for uint256;
+    IERC20 public immutable cUSD;
 
-    // Contracts are deployed using the first signer/account by default
-    const [owner, otherAccount] = await ethers.getSigners();
+    uint256 constant minimumPremium = 50 ether;
+    uint256 constant minimumClaimInsurance = 1000 ether;
+    uint256 constant tokenRation = 20;
 
-    const Lock = await ethers.getContractFactory("Lock");
-    const lock = await Lock.deploy(unlockTime, { value: lockedAmount });
+    struct Members {
+        uint256 usdValue; 
+        uint256 citValue;
+        uint256 premi;
+        uint256 registerDate;
+        uint256 lastPayment;
+        uint256 nextPayment;
+    }
 
-    return { lock, unlockTime, lockedAmount, owner, otherAccount };
-  }
+    mapping(address => Members) private _addressToMembers;
+    mapping(address => bool) private _addressStatus;
+    mapping (address => uint256[]) private _addressClaimHistory;
+    mapping (address => uint256[]) private _addressPaymentHistory;
 
-  describe("Deployment", function () {
-    it("Should set the right unlockTime", async function () {
-      const { lock, unlockTime } = await loadFixture(deployOneYearLockFixture);
+    event NewRegistration(address indexed members, uint256 timestamp);
 
-      expect(await lock.unlockTime()).to.equal(unlockTime);
-    });
+    constructor(address _cUSD)ERC20("CropInsuranceToken", "CIT") {
+        cUSD = IERC20(_cUSD);
+    }
 
-    it("Should set the right owner", async function () {
-      const { lock, owner } = await loadFixture(deployOneYearLockFixture);
-
-      expect(await lock.owner()).to.equal(owner.address);
-    });
-
-    it("Should receive and store the funds to lock", async function () {
-      const { lock, lockedAmount } = await loadFixture(
-        deployOneYearLockFixture
-      );
-
-      expect(await ethers.provider.getBalance(lock.target)).to.equal(
-        lockedAmount
-      );
-    });
-
-    it("Should fail if the unlockTime is not in the future", async function () {
-      // We don't use the fixture here because we want a different deployment
-      const latestTime = await time.latest();
-      const Lock = await ethers.getContractFactory("Lock");
-      await expect(Lock.deploy(latestTime, { value: 1 })).to.be.revertedWith(
-        "Unlock time should be in the future"
-      );
-    });
-  });
-
-  describe("Withdrawals", function () {
-    describe("Validations", function () {
-      it("Should revert with the right error if called too soon", async function () {
-        const { lock } = await loadFixture(deployOneYearLockFixture);
-
-        await expect(lock.withdraw()).to.be.revertedWith(
-          "You can't withdraw yet"
+    function register(uint256 _usdAmount) external {
+        require(_usdAmount >= minimumPremium, "Insurance: Minimum premium is 50 cUSD");
+        require(!_addressStatus[msg.sender], "Insurance: You are already registered");
+        cUSD.transferFrom(msg.sender, address(this), _usdAmount);
+        uint256 _citAmount = _usdAmount.mul(tokenRation);
+        _addressToMembers[msg.sender] = Members(
+            _usdAmount,
+            _citAmount,
+            _usdAmount,
+            block.timestamp,
+            block.timestamp,
+            block.timestamp.add(30 days)
         );
-      });
+        _addressStatus[msg.sender] = true;
+        _addressPaymentHistory[msg.sender].push(block.timestamp);
+        _mint(msg.sender, _citAmount);
+        emit NewRegistration(msg.sender, block.timestamp);
+    }
 
-      it("Should revert with the right error if called from another account", async function () {
-        const { lock, unlockTime, otherAccount } = await loadFixture(
-          deployOneYearLockFixture
-        );
+    function claim(uint256 _citAmount) external {
+        require(_citAmount >= minimumClaimInsurance, "Insurance: Minimum claim is 1000 CIT");
+        require(_addressStatus[msg.sender], "Insurance: You are not registered");
+        uint256 _usdAmount = _citAmount.div(tokenRation);
+        Members storage members = _addressToMembers[msg.sender];
+        members.usdValue = members.usdValue.sub(_usdAmount);
+        members.citValue = members.citValue.sub(_citAmount);
+        _addressClaimHistory[msg.sender].push(block.timestamp);
+        _burn(msg.sender, _citAmount);
+        cUSD.transfer(msg.sender, _usdAmount);
+    }
 
-        // We can increase the time in Hardhat Network
-        await time.increaseTo(unlockTime);
+    function pay(uint256 _usdAmount) external {
+        require(_addressStatus[msg.sender], "Insurance: You are not registered");
+        Members storage members = _addressToMembers[msg.sender];
+        require(_usdAmount >= members.premi, "Insurance: Payment amount is less than the premium");
+        require(block.timestamp >= members.nextPayment, "Insurance: Payment is not due");
+        cUSD.transferFrom(msg.sender, address(this), _usdAmount);
+        uint256 _citAmount = _usdAmount.mul(tokenRation);
+        members.usdValue = members.usdValue.add(_usdAmount);
+        members.citValue = members.citValue.add(_citAmount);
+        members.lastPayment = block.timestamp;
+        members.nextPayment = block.timestamp.add(30 days);
+        _addressPaymentHistory[msg.sender].push(block.timestamp);
+        _mint(msg.sender, _citAmount);
+    }
 
-        // We use lock.connect() to send a transaction from another account
-        await expect(lock.connect(otherAccount).withdraw()).to.be.revertedWith(
-          "You aren't the owner"
-        );
-      });
-
-      it("Shouldn't fail if the unlockTime has arrived and the owner calls it", async function () {
-        const { lock, unlockTime } = await loadFixture(
-          deployOneYearLockFixture
-        );
-
-        // Transactions are sent using the first signer by default
-        await time.increaseTo(unlockTime);
-
-        await expect(lock.withdraw()).not.to.be.reverted;
-      });
-    });
-
-    describe("Events", function () {
-      it("Should emit an event on withdrawals", async function () {
-        const { lock, unlockTime, lockedAmount } = await loadFixture(
-          deployOneYearLockFixture
-        );
-
-        await time.increaseTo(unlockTime);
-
-        await expect(lock.withdraw())
-          .to.emit(lock, "Withdrawal")
-          .withArgs(lockedAmount, anyValue); // We accept any value as `when` arg
-      });
-    });
-
-    describe("Transfers", function () {
-      it("Should transfer the funds to the owner", async function () {
-        const { lock, unlockTime, lockedAmount, owner } = await loadFixture(
-          deployOneYearLockFixture
-        );
-
-        await time.increaseTo(unlockTime);
-
-        await expect(lock.withdraw()).to.changeEtherBalances(
-          [owner, lock],
-          [lockedAmount, -lockedAmount]
-        );
-      });
-    });
-  });
-});
+    function getInsurance() external view returns (Members memory) {
+        return _addressToMembers[msg.sender];
+    }
+}
